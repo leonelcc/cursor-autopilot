@@ -46,6 +46,7 @@ const defaultConfig = {
 const cursorRuleContent = `---
 description: Always write a chat-end JSON summary to ./tmp
 alwaysApply: true
+globs: ["*"]
 ---
 
 # 📝 Chat-End Summary Rule

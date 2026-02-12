@@ -53,6 +53,7 @@ export default function Telegram(cfg: any): Adapter {
   let bot: TelegramBot;
   let replyHandler: (r: string) => void = () => {};
   let isDisposed = false;
+  const processedIds = new Set<number>();
 
   try {
     bot = new TelegramBot(cfg.token, botOptions);
@@ -94,16 +95,15 @@ export default function Telegram(cfg: any): Adapter {
   // 消息处理
   bot.on('message', (m: any) => {
     if (isDisposed) return;
-    
-    console.log('[Telegram] Received message:', {
-      chatId: m.chat.id,
-      text: m.text,
-      expectedChatId: cfg.chatId
-    });
-    
-    if (m.chat.id.toString() === cfg.chatId) {
-      replyHandler(m.text || '');
+    if (m.chat.id.toString() !== cfg.chatId) return;
+    if (processedIds.has(m.message_id)) {
+      console.log('[Telegram] Ignorando mensagem duplicada:', m.message_id);
+      return;
     }
+    processedIds.add(m.message_id);
+    if (processedIds.size > 500) processedIds.clear();
+    console.log('[Telegram] Received message:', { messageId: m.message_id, text: (m.text || '').substring(0, 50) });
+    replyHandler(m.text || '');
   });
 
   return {
@@ -118,12 +118,12 @@ export default function Telegram(cfg: any): Adapter {
         
         const message = `📝 *Summary*\n${s.summary}\n\n➡️ *Current Status*\n${s.current_status}\n\nReply 1=continue or type any instruction to continue building`;
         
-        const result = await bot.sendMessage(cfg.chatId, message, { 
+        const result = await bot.sendMessage(cfg.chatId, message, {
           parse_mode: 'Markdown',
           disable_web_page_preview: true
         });
-        
-        console.log('[Telegram] Message sent successfully:', result.message_id);
+
+        console.log('[Telegram] Message sent successfully to chat', cfg.chatId, 'message_id:', result.message_id);
       } catch (error: any) {
         console.error('[Telegram] Failed to send message:', error);
         

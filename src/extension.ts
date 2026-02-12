@@ -1,7 +1,9 @@
 import * as vscode from 'vscode';
 import { exec } from 'child_process';
+import * as fs from 'fs';
+import * as path from 'path';
 import { load } from './core/store';
-import { sub } from './core/dispatcher';
+import { sub, pub } from './core/dispatcher';
 import { watch } from './core/watcher';
 import { adapterMap, Adapter } from './adapters';
 import { sendToChat } from './core/inject';
@@ -46,6 +48,38 @@ export function activate(ctx: vscode.ExtensionContext) {
     });
     ctx.subscriptions.push(testDisposable);
     console.log('[Autopilot] autopilot.test command registered successfully');
+
+    const resendDisposable = vscode.commands.registerCommand('autopilot.resendLastSummary', () => {
+      const root = vscode.workspace.workspaceFolders?.[0];
+      if (!root) {
+        vscode.window.showWarningMessage('Nenhum workspace aberto.');
+        return;
+      }
+      const tmpDir = path.join(root.uri.fsPath, 'tmp');
+      if (!fs.existsSync(tmpDir)) {
+        vscode.window.showWarningMessage('Pasta tmp não existe. Não há summary para enviar.');
+        return;
+      }
+      const files = fs.readdirSync(tmpDir)
+        .filter((f) => f.startsWith('summary-') && f.endsWith('.json'))
+        .map((f) => ({ name: f, path: path.join(tmpDir, f), mtime: fs.statSync(path.join(tmpDir, f)).mtimeMs }))
+        .sort((a, b) => b.mtime - a.mtime);
+      if (files.length === 0) {
+        vscode.window.showWarningMessage('Nenhum summary encontrado em tmp/');
+        return;
+      }
+      try {
+        const content = fs.readFileSync(files[0].path, 'utf8');
+        const parsed = JSON.parse(content);
+        const data = { summary: parsed.summary || '', current_status: parsed.current_status || '' };
+        pub('summary', data);
+        vscode.window.showInformationMessage(`Summary enviado ao Telegram: ${files[0].name}`);
+      } catch (e) {
+        vscode.window.showErrorMessage(`Erro ao enviar: ${e}`);
+      }
+    });
+    ctx.subscriptions.push(resendDisposable);
+    console.log('[Autopilot] autopilot.resendLastSummary command registered');
 
     // Load configuration (this will auto-create .autopilot.json if it doesn't exist)
     const store = load();
@@ -99,9 +133,19 @@ export function activate(ctx: vscode.ExtensionContext) {
       }
     });
 
+    const SUMMARY_REMINDER = '\n\n[No final: escreva tmp/summary-*.json (summary + current_status) para retorno ao Telegram.]';
+    let lastReply = { text: '', time: 0 };
+    const DEDUPE_MS = 5000;
+
     actives.forEach(a => a.onReply(r => {
       const resp = r.trim()==='1' ? 'Continue ✅' : r.trim()==='2' ? 'Stop ❌' : r;
-      sendToChat(resp);
+      const now = Date.now();
+      if (resp === lastReply.text && now - lastReply.time < DEDUPE_MS) {
+        console.log('[Autopilot] Ignorando mensagem duplicada:', resp.substring(0, 30));
+        return;
+      }
+      lastReply = { text: resp, time: now };
+      sendToChat(resp + SUMMARY_REMINDER);
     }));
 
     sub('summary', s => {
@@ -212,6 +256,17 @@ async function osLevelSend() {
     // Then send the keystroke
     await execPromise(`osascript -e 'tell application "System Events" to keystroke return using {command down}'`);
     console.log('[cursorInject] Sent Cmd+Enter via AppleScript');
+  } else if (process.platform === 'win32') {
+    // Windows: PowerShell + WScript.Shell to activate Cursor and send Ctrl+Enter
+    const script = [
+      "$ws = New-Object -ComObject WScript.Shell",
+      "if (-not $ws.AppActivate('Cursor')) { exit 1 }",
+      "Start-Sleep -Milliseconds 400",
+      "$ws.SendKeys('^{ENTER}')"
+    ].join('; ');
+    const encoded = Buffer.from(script, 'utf16le').toString('base64');
+    await execPromise(`powershell -WindowStyle Hidden -ExecutionPolicy Bypass -EncodedCommand ${encoded}`);
+    console.log('[cursorInject] Sent Ctrl+Enter via PowerShell');
   } else if (process.platform === 'linux') {
     // For Linux, we need to focus the window first
     await execPromise(`wmctrl -a "Cursor"`);

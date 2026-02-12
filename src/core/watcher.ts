@@ -13,24 +13,22 @@ export function watch() {
   const watcher = vscode.workspace.createFileSystemWatcher(pattern);
 
   const safeRead = (u: vscode.Uri) => {
-    try { 
+    try {
       const content = fs.readFileSync(u.fsPath, 'utf8');
-      console.log(`[Autopilot] Reading file: ${u.fsPath}, content: ${content}`);
-      
       const parsed = JSON.parse(content);
-      
-      // 验证必要字段
       if (!parsed.summary && !parsed.current_status) {
-        console.error(`[Autopilot] Invalid JSON structure in ${u.fsPath}: missing summary or current_status`);
+        console.error(`[Autopilot] Invalid JSON in ${u.fsPath}: missing summary and current_status`);
         return null;
       }
-      
-      return parsed;
+      return { summary: parsed.summary || '', current_status: parsed.current_status || '' };
     } catch (error) {
-      console.error(`[Autopilot] Error reading/parsing file ${u.fsPath}:`, error);
+      console.error(`[Autopilot] Error reading/parsing ${u.fsPath}:`, error);
       return null;
     }
   };
+
+  // Normalize path for consistent comparison (Windows: different slash/casing)
+  const norm = (p: string) => path.normalize(path.resolve(p));
 
   // Track processed files to avoid duplicates
   const processedFiles = new Set<string>();
@@ -40,7 +38,7 @@ export function watch() {
     if (fs.existsSync(tmpDir)) {
       const existingFiles = fs.readdirSync(tmpDir)
         .filter(file => file.startsWith('summary-') && file.endsWith('.json'))
-        .map(file => path.join(tmpDir, file));
+        .map(file => norm(path.join(tmpDir, file)));
       
       existingFiles.forEach(filePath => {
         processedFiles.add(filePath);
@@ -52,27 +50,57 @@ export function watch() {
     console.error('[Autopilot] Error reading existing files:', error);
   }
 
-  watcher.onDidCreate(u => { 
-    if (!processedFiles.has(u.fsPath)) {
-      const d = safeRead(u); 
-      if (d) {
-        processedFiles.add(u.fsPath);
-        pub('summary', d);
-        console.log('[Autopilot] Processing new summary file:', u.fsPath);
-      }
-    }
-  });
-  
-  watcher.onDidChange(u => { 
-    if (!processedFiles.has(u.fsPath)) {
-      const d = safeRead(u); 
-      if (d) {
-        processedFiles.add(u.fsPath);
-        pub('summary', d);
-        console.log('[Autopilot] Processing changed summary file:', u.fsPath);
-      }
-    }
-  });
+  // Longer delay on Windows so file is fully flushed to disk before reading
+  const fileReadyDelay = process.platform === 'win32' ? 450 : 200;
 
-  return watcher;
+  const processFile = (u: vscode.Uri) => {
+    const key = norm(u.fsPath);
+    if (processedFiles.has(key)) return;
+    processedFiles.add(key);
+    setTimeout(() => {
+      const d = safeRead(u);
+      if (d) {
+        pub('summary', d);
+        console.log('[Autopilot] Published summary to adapters (Telegram etc.):', u.fsPath);
+      } else {
+        processedFiles.delete(key);
+      }
+    }, fileReadyDelay);
+  };
+
+  watcher.onDidCreate(u => processFile(u));
+  watcher.onDidChange(u => processFile(u));
+
+  // Polling fallback: FileSystemWatcher can miss events on Windows
+  const pollInterval = setInterval(() => {
+    try {
+      if (!fs.existsSync(tmpDir)) return;
+      const files = fs.readdirSync(tmpDir)
+        .filter((f) => f.startsWith('summary-') && f.endsWith('.json'))
+        .map((f) => path.join(tmpDir, f));
+      for (const fp of files) {
+        const key = norm(fp);
+        if (processedFiles.has(key)) continue;
+        processedFiles.add(key);
+        const d = safeRead(vscode.Uri.file(fp));
+        if (d) {
+          pub('summary', d);
+          console.log('[Autopilot] Published summary via polling:', fp);
+        } else {
+          processedFiles.delete(key);
+        }
+      }
+    } catch (e) {
+      console.error('[Autopilot] Poll error:', e);
+    }
+  }, 3000);
+
+  const disposable = {
+    dispose: () => {
+      watcher.dispose();
+      clearInterval(pollInterval);
+    }
+  };
+
+  return disposable;
 }
